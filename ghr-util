@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+
+import argparse
+import platform
+import sys
+import os
+import shutil
+import subprocess
+import re
+import json
+import tempfile
+from github import Github
+from github import Auth
+from github import GithubException
+import requests
+import semver
+
+
+# Global data
+ARCH = platform.uname()
+ARCH_SYSTEM = ARCH.system.lower()
+ARCH_MACHINE = ARCH.machine.lower()
+MACHINE_KEYWORD = {
+                    'x86_64' :  'amd64'
+                  }
+TMPDIR = os.path.join(tempfile.gettempdir(), "ghr-util")
+
+
+def fatal(ret_code, str = None):
+  if str is not None:
+    print(f"{str}", file=sys.stderr)
+  exit(ret_code)
+
+
+def ensure_binaries(prgs):
+  if isinstance(prgs, str):
+    if shutil.which(prgs) is None:
+      fatal(1, f"{prgs} is required, but not found")
+    return True
+  elif hasattr(prgs, '__iter__'):
+    for prg in prgs:
+      ensure_binaries(prg)
+
+
+def run_prog(prog, args, input=None):
+  run_args = [prog]
+  run_args.extend(args)
+  try:
+    result = subprocess.run(run_args, input=input, capture_output=True, text=True)
+  except:
+    fatal(1, f"Failed to execute: {" ".join(run_args)}")
+
+  if result.returncode != 0 or len(result.stderr) > 0:
+    fatal(1, f"Failed to execute: {" ".join(run_args)}\nReturn Code {result.returncode}\n{result.stderr}")
+
+  return result.stdout
+
+
+def sanitize_semver(ver):
+  # strip leading zeros
+  ver = ver.lstrip('vV').strip()
+  cleaned_ver = []
+  for s in ver.split('.'):
+    s = s.lstrip('0')
+    if len(s) > 0:
+      cleaned_ver.append(s)
+    else:
+      cleaned_ver.append('0')
+  return ".".join(cleaned_ver)
+
+
+def select_deb_asset(names):
+
+  # must have a deb extension
+  candidates = list(names)
+  name_tags = {}
+  for name in candidates:
+    name_tags[name] = [ s.lower() for s in re.split(r'-|_|\.', name) ]
+  candidates = [ name for name in candidates if name.endswith(".deb")]
+  candidates = [ name for name in candidates if MACHINE_KEYWORD[ARCH_MACHINE] in name_tags[name] ]
+  if len(candidates) > 1:
+    candidates = [ name for name in candidates if 'musl' not in name_tags[name] ]
+
+  if len(candidates) > 1:
+    print(f"WARNING: multiple viable candidates:")
+    for candidate in candidates:
+      print(f"  {candidate}")
+  return candidates[0] if len(candidates) > 0 else None
+
+
+def select_tar_asset(names):
+
+  candidates = list(names)
+  name_tags = {}
+  for name in candidates:
+    name_tags[name] = [ s.lower() for s in re.split(r'-|_|\.', name) ]
+  candidates = list(name_tags.keys())
+  candidates = [ name for name in candidates if 'tar' in name_tags[name] ]
+  candidates = [ name for name in candidates if ARCH_SYSTEM in name_tags[name] ]
+  candidates = [ name for name in candidates if MACHINE_KEYWORD[ARCH_MACHINE] in name_tags[name] ]
+
+  if len(candidates) > 1:
+    print(f"WARNING: multiple viable candidates:")
+    for candidate in candidates:
+      print(f"  {candidate}")
+  return candidates[0] if len(candidates) > 0 else None
+
+
+def select_asset(pkg, names):
+  if pkg['type'] == 'deb':
+    return select_deb_asset(names)
+  elif pkg['type'] == 'tar':
+    return select_tar_asset(names)
+  return None
+
+
+def install_deb(fname):
+  return False
+
+
+def install_tar(fname):
+  return False
+
+
+def update_package(gh, token, pkg, dry_run):
+  pkg_name = pkg['name']
+  pkg_type = pkg['type']
+  installed_ver = None
+  result = run_prog(pkg['version_cmd'], pkg['version_args']).split("\n")[0]
+  m = re.match(pkg['version_match'], result)
+  if m:
+    installed_ver = sanitize_semver(m.group(1))
+
+  try:
+    repo = gh.get_repo(pkg['repo'])
+    release = repo.get_latest_release()
+  except GithubException as err:
+    print(f"Failed accessing github repo for {pkg_name}: {err.status}")
+    return
+
+  released_ver = sanitize_semver(release.name)
+  print(f"Pkg {pkg_name} Installed: {installed_ver}, released: {released_ver}")
+  if installed_ver is None or semver.compare(installed_ver, released_ver) < 0:
+
+    if installed_ver is None:
+      print(f"Installing {pkg_name} version {released_ver}")
+    else:
+      print(f"Upgrading {pkg_name} version from {installed_ver} to {released_ver}")
+
+    # newer version on github
+    assets = {}
+    for asset in release.get_assets():
+      assets[asset.name] = asset
+
+    asset_name = select_asset(pkg, assets.keys())
+    if asset_name is None:
+      print(f"Unable to find matching asset for {pkg_name} in release {released_ver}")
+    else:
+      asset = assets[asset_name]
+
+      if dry_run:
+        print(f"Selected {asset_name} for download and installation.")
+      else:
+
+        # download asset to tmp directory
+        os.makedirs(TMPDIR, exist_ok=True)
+        headers = { "Authorization": f"token {token}", "Accept": "application/octet-stream"}
+        response = requests.Session().get(asset.url, stream=True, headers=headers)
+        pathname = os.path.join(TMPDIR, asset.name)
+        print(f"Downloading {asset.name} ...", end = '')
+        with open(pathname, "wb") as outfile:
+          for chunk in response.iter_content(1024*1024):
+            outfile.write(chunk)
+        print(" Done")
+
+        if pkg_type == 'deb':
+          if install_deb(pathname):
+            os.remove(pathname)
+          else:
+            print(f"Installation failed.  deb file remains at: {pathname}")
+        elif pkg_type == 'tar':
+          if install_tar(pathname):
+            os.remove(pathname)
+          else:
+            print(f"Installation failed.  tar file remains at: {pathname}")
+        else:
+          print(f"unrecognized package type: {pkg_type}")
+
+
+def main(args):
+
+  # load the configuration
+  cfg = {}
+  try:
+    with open(args.file) as infile:
+      cfg = json.load(infile)
+  except IOError as err:
+    fatal(1, f"{err}")
+  except Exception as err:
+    fatal(1, f"Unexpected {err=}, {type(err)=}")
+
+  # get an authorized github instance
+  auth = Auth.Token(args.token)
+  gh = Github(auth=auth)
+
+  for pkg in cfg:
+    update_package(gh, args.token, pkg, args.dry_run)
+
+  return 0
+
+
+if __name__ == "__main__":
+  ensure_binaries([])
+  parser = argparse.ArgumentParser(prog='ghr-util', description='Utility for updating packages/binaries from Github releases', epilog='')
+  parser.add_argument("op", choices=['update'], help="Operation to perform.")
+  parser.add_argument("--token", default=None, help="File to load/dump.")
+  parser.add_argument("file", help="Configuration file.")
+  parser.add_argument("-n", "--dry-run", action="store_true", help="Do not download packages, just say what would be done.")
+  # parser.add_argument("-f", "--force", action="store_true", help="Force loading mismatched extension version")
+  # parser.add_argument("--exclude", nargs="+", default=[], help="Exclude extension by UUID")
+  # parser.add_argument("--exclude-from", nargs=1, help="File containing list of excluded UUID(s)")
+  args = parser.parse_args()
+  exit(main(args))
