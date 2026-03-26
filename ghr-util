@@ -42,16 +42,20 @@ def ensure_binaries(prgs):
       ensure_binaries(prg)
 
 
-def run_prog(prog, args, input=None):
+def run_prog(prog, args, input=None, silent_fail=True):
   run_args = [prog]
   run_args.extend(args)
   try:
     result = subprocess.run(run_args, input=input, capture_output=True, text=True)
   except:
-    fatal(1, f"Failed to execute: {" ".join(run_args)}")
+    if not silent_fail:
+      fatal(1, f"Failed to execute: {" ".join(run_args)}")
+    return None
 
   if result.returncode != 0 or len(result.stderr) > 0:
-    fatal(1, f"Failed to execute: {" ".join(run_args)}\nReturn Code {result.returncode}\n{result.stderr}")
+    if not silent_fail:
+      fatal(1, f"Failed to execute: {" ".join(run_args)}\nReturn Code {result.returncode}\n{result.stderr}")
+    return None
 
   return result.stdout
 
@@ -114,6 +118,23 @@ def select_asset(pkg, names):
   return None
 
 
+def version_deb(name):
+  result = run_prog('dpkg-query', ['--show', name])
+  if result is not None and isinstance(result, str) and len(result) > 0:
+    return sanitize_semver(result.split()[1].split('-')[0])
+  return None
+
+
+def version_tar(cmd, args, match):
+  result = run_prog(cmd, args)
+  if result is not None and len(result) > 0:
+    result = result.split("\n")[0]
+    match = re.match(match, result)
+    if match:
+      return sanitize_semver(match.group(1))
+  return None
+
+
 def install_deb(fname):
   return False
 
@@ -126,10 +147,14 @@ def update_package(gh, token, pkg, dry_run):
   pkg_name = pkg['name']
   pkg_type = pkg['type']
   installed_ver = None
-  result = run_prog(pkg['version_cmd'], pkg['version_args']).split("\n")[0]
-  m = re.match(pkg['version_match'], result)
-  if m:
-    installed_ver = sanitize_semver(m.group(1))
+
+  if pkg_type == "deb":
+    installed_ver = version_deb(pkg_name)
+  elif pkg_type == "tar":
+    installed_ver = version_tar(pkg['version_cmd'], pkg['version_args'], pkg['version_match'])
+
+  print(f"{pkg_name}: {installed_ver}")
+  return
 
   try:
     repo = gh.get_repo(pkg['repo'])
