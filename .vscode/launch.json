@@ -11,7 +11,7 @@
       "request": "launch",
       "program": "${file}",
       "console": "integratedTerminal",
-      "args": [ "--dry-run", "update", "--token=${env:GITHUB_TOKEN}", "${env:XDG_CONFIG_HOME}/host-config/ghr.json" ]
+      "args": [ "update", "--verbose", "--token=${env:GITHUB_TOKEN}", "${env:XDG_CONFIG_HOME}/host-config/ghr.yaml" ]
       // "args": "${command:pickArgs}"
     }
   ]
