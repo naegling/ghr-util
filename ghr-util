@@ -10,12 +10,16 @@ import shlex
 import subprocess
 import re
 import tempfile
+import requests
+import functools
 from github import Github
 from github import Auth
 from github import GithubException
-import requests
-import semver
 
+# TODO: argparse handling is wrong
+# TODO: auto-install tarball
+# TODO: auto try pass for token
+# TODO: update/install -> install always installs
 
 MODE_LIST = 1
 MODE_INFO = 2
@@ -84,21 +88,6 @@ def run_prog(prog, args=None, input=None, silent_fail=True):
   return result.stdout
 
 
-def sanitize_semver(ver):
-  # strip leading zeros
-  if ver is not None and len(ver) > 0:
-    ver = ver.lstrip('vV').strip()
-    cleaned_ver = []
-    for s in ver.split('.'):
-      s = s.lstrip('0')
-      if len(s) > 0:
-        cleaned_ver.append(s)
-      else:
-        cleaned_ver.append('0')
-    return ".".join(cleaned_ver)
-  return None
-
-
 def select_asset(names, exts, require, disallow, prefer, avoid):
 
   name_tags = {}
@@ -163,10 +152,50 @@ def select_asset(names, exts, require, disallow, prefer, avoid):
   return candidates
 
 
-def safe_ver(ver):
-  if ver is None:
-    return 'None'
-  return ver
+@functools.total_ordering
+class Version:
+
+  def __init__(self):
+    self.major = 0
+    self.minor = 0
+    self.patch = 0
+
+  def __init__(self, s):
+    self.__init__()
+    s = s.lstrip("vV")
+    if s is not None and isinstance(s, str) and len(s) > 0:
+      if re.match('^[0-9.]+$', s):
+        segs = s.split('.')
+        if len(segs) > 0:
+          self.major = int(segs[0])
+          if len(segs) > 1:
+            self.minor = int(segs[1])
+            if len(segs) > 2:
+              self.patch = int(segs[2])
+
+  def _is_valid_operand(self, other):
+    return hasattr(other, 'major') and hasattr(other, 'minor') and hasattr(other, 'patch')
+
+  def __eq__(self, other):
+    if not self._is_valid_operand(other):
+      return NotImplemented
+    return self.major == other.major and self.minor == other.minor and self.patch == other.patch
+
+  def __lt__(self, other):
+    if not self._is_valid_operand(other):
+      return NotImplemented
+    return (self.major, self.minor, self.patch) < (other.major, other.minor, other.patch)
+
+  def __str__(self):
+    if self.major == 0 and self.minor == 0 and self.patch == 0:
+      return "None"
+    return f"{self.major}.{self.minor}.{self.patch}"
+
+  def __format__(self, format_spec):
+    return format(self.major, format_spec)
+
+  def is_missing(self):
+    return self.major == 0 and self.minor == 0 and self.patch == 0
 
 
 class BasePkgHandler:
@@ -209,8 +238,8 @@ class DebPkgHandler(BasePkgHandler):
       result = result.split()
       if len(result) > 1:
         result = result[1]
-        return sanitize_semver(result.split('-')[0])
-    return None
+        return Version(result.split('-')[0])
+    return Version()
 
   def select_asset(self, candidates):
     return select_asset(candidates, DEB_EXTENSIONS, self.require, self.disallow, self.prefer, self.avoid)
@@ -241,8 +270,8 @@ class TarballPkgHandler(BasePkgHandler):
       result = result.split("\n")[0]
       match = re.match(self.ver_match, result)
       if match:
-        return sanitize_semver(match.group(1))
-    return None
+        return Version(match.group(1))
+    return Version()
 
   def select_asset(self, candidates):
     return select_asset(candidates, TAR_EXTENSIONS, self.require, self.disallow, self.prefer, self.avoid)
@@ -255,14 +284,14 @@ class TarballPkgHandler(BasePkgHandler):
 
 def list_package(hdlr, name, pkg):
   hdlr.set_pkg(name, pkg)
-  print(f"{hdlr.get_type():<3} {name+":":<15} {safe_ver(hdlr.get_installed_ver()):<10}")
+  print(f"{hdlr.get_type():<3} {name+":":<15} {hdlr.get_installed_ver():<10}")
 
 
 def do_op(op, hdlr, gh, token, name, pkg, prefs):
 
   hdlr.set_pkg(name, pkg, prefs)
   installed_ver = hdlr.get_installed_ver()
-  print(f"{hdlr.get_type():<3} {name+":":<15} {safe_ver(installed_ver):<10}", end='')
+  print(f"{hdlr.get_type():<3} {name+":":<15} {installed_ver:<10}", end='')
 
   # get the repo's latest release
   try:
@@ -276,19 +305,19 @@ def do_op(op, hdlr, gh, token, name, pkg, prefs):
     print(f"\nFailed: Release not found for {name} at {hdlr.repo}.")
     return
 
-  released_ver = sanitize_semver(release.tag_name)
+  released_ver = Version(release.tag_name)
   if released_ver is None:
     print(f"\nFailed: Unreadable release version for {name} at {hdlr.repo}.")
     return
 
-  print(f" {safe_ver(released_ver):<10}", end='')
+  print(f" {released_ver:<10}", end='')
 
   # newer version on github, construct a map of assets
   assets = {}
   for asset in release.get_assets():
     assets[asset.name] = asset
 
-  update_avail = installed_ver is None or semver.compare(installed_ver, released_ver) < 0
+  update_avail = released_ver is not None and (installed_ver is None or installed_ver < released_ver)
   if not update_avail:
     print("     ", end='')
   elif op == MODE_DOWNLOAD:
@@ -309,7 +338,7 @@ def do_op(op, hdlr, gh, token, name, pkg, prefs):
     # if this is just for info or no update is available, we're all done
     if op != MODE_INFO and update_avail:
 
-      print(f"Downloading {asset.name} to {TMPDIR} ... ", end='')
+      print(f"\n\nDownloading {asset.name} to {TMPDIR} ... ", end='')
 
       # download asset to tmp directory
       os.makedirs(TMPDIR, exist_ok=True)
