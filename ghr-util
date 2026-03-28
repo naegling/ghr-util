@@ -155,13 +155,10 @@ def select_asset(names, exts, require, disallow, prefer, avoid):
 @functools.total_ordering
 class Version:
 
-  def __init__(self):
+  def __init__(self, s=None):
     self.major = 0
     self.minor = 0
     self.patch = 0
-
-  def __init__(self, s):
-    self.__init__()
     s = s.lstrip("vV")
     if s is not None and isinstance(s, str) and len(s) > 0:
       if re.match('^[0-9.]+$', s):
