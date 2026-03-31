@@ -7,5 +7,4 @@ requires-python = ">=3.14"
 dependencies = [
     "pygithub>=2.9.0",
     "pyyaml>=6.0.3",
-    "semver>=3.0.4",
 ]
