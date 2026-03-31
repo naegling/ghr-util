@@ -281,9 +281,13 @@ def do_op(op, hdlr, gh, token, name, pkg, prefs):
 
   hdlr.set_pkg(name, pkg, prefs)
   installed_ver = hdlr.get_installed_ver()
-  print(f"{hdlr.get_type():<3} {name+":":<15} {str(installed_ver):<10}", end='')
+  if op == MODE_INSTALL and not installed_ver.is_missing():
+    # if install mode and any version is installed, return silently
+    return
 
+  print(f"{hdlr.get_type():<3} {name+":":<15} {str(installed_ver):<10}", end='')
   if op == MODE_LIST:
+    # if we are only listing, then we are done
     print()
     return
 
