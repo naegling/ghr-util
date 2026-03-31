@@ -10,17 +10,22 @@ import shlex
 import subprocess
 import re
 import tempfile
+import requests
+import functools
 from github import Github
 from github import Auth
 from github import GithubException
-import requests
-import semver
 
+# TODO: auto-install tarball. for my current tarballs that means...
+#   fzf:  fzf--.tar.gz → fzf, chown, mv to /usr/bin
+#   skim: skim--*.tar.xz gzip skim../man/man1/sk.1, chown, mv sk.1.gz /usr/share/man/man1, chown sk, mv sk /usr/bin
+#   starship: starship--.tar.gz → starship, chown, mv to /usr/bin
 
 MODE_LIST = 1
 MODE_INFO = 2
 MODE_DOWNLOAD = 3
 MODE_UPDATE = 4
+MODE_INSTALL = 5
 
 
 # Global data
@@ -30,7 +35,9 @@ ARCH_MACHINE = ARCH.machine.lower()
 ALT_MACHINE_KEYWORDS = {
                         'x86_64' :  ['amd64']
                         }
-TAR_EXTENSIONS = ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz', '.tar.xz', '.txz' ]
+
+DEB_EXTENSIONS = ['.deb']
+TAR_EXTENSIONS = ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz', '.tar.xz', '.txz']
 TMPDIR = os.path.join(tempfile.gettempdir(), "ghr-util")
 
 def fatal(ret_code, str = None):
@@ -82,25 +89,108 @@ def run_prog(prog, args=None, input=None, silent_fail=True):
   return result.stdout
 
 
-def sanitize_semver(ver):
-  # strip leading zeros
-  if ver is not None and len(ver) > 0:
-    ver = ver.lstrip('vV').strip()
-    cleaned_ver = []
-    for s in ver.split('.'):
-      s = s.lstrip('0')
-      if len(s) > 0:
-        cleaned_ver.append(s)
-      else:
-        cleaned_ver.append('0')
-    return ".".join(cleaned_ver)
-  return None
+def select_asset(names, exts, require, disallow, prefer, avoid):
+
+  name_tags = {}
+
+  # gotta consider all of the possible extensions
+  for name in names:
+    for ext in exts:
+      if name.endswith(ext):
+        tmp = name[:-len(ext)]
+        # deal with annoying case of a token with an embedded split char
+        tmp = tmp.replace('x86_64', 'x86@64')
+        tmp = re.split(r'-|_|\.', tmp)
+        name_tags[name] = [ s.lower().replace('x86@64', 'x86_64') for s in tmp ]
+        break
+
+  candidates = list(name_tags.keys())
+
+  # first only consider candidates that include required
+  for keyword in require:
+    candidates = [ name for name in candidates if keyword in name_tags[name] ]
+
+  # now discard the candidates in disallowed
+  for keyword in disallow:
+    candidates = [ name for name in candidates if keyword not in name_tags[name] ]
+
+  # if this is down to a single candiate, then we're done
+  if len(candidates) > 0:
+
+    # try each of the ARCH_MACHINE keywords
+    for keyword in get_machine_keywords():
+      potentials = [ name for name in candidates if keyword in name_tags[name] ]
+      if len(potentials) > 0:
+        candidates = potentials
+
+    # still have a choice to make
+    if len(candidates) > 1:
+
+      # try to filter based on system.  revert if no remaining candidate
+      potentials = [ name for name in candidates if ARCH_SYSTEM in name_tags[name] ]
+      if len(potentials) > 0:
+        candidates = potentials
+
+      # still have a choice to make
+      if len(candidates) > 1:
+
+        for keyword in prefer:
+          potentials = [ name for name in candidates if keyword in name_tags[name] ]
+          if len(potentials) > 0:
+            if len(potentials) == 1:
+              return potentials
+            else:
+              candidates = potentials
+
+        for keyword in avoid:
+          potentials = [ name for name in candidates if keyword not in name_tags[name] ]
+          if len(potentials) > 0:
+            if len(potentials) == 1:
+              return potentials
+            else:
+              candidates = potentials
+
+  return candidates
 
 
-def safe_ver(ver):
-  if ver is None:
-    return 'None'
-  return ver
+@functools.total_ordering
+class Version:
+
+  def __init__(self, s=None):
+    self.major = 0
+    self.minor = 0
+    self.patch = 0
+    if s is not None and isinstance(s, str):
+      s = s.lstrip("vV")
+      if len(s) > 0 and re.match('^[0-9.]+$', s):
+        segs = s.split('.')
+        if len(segs) > 0:
+          self.major = int(segs[0])
+          if len(segs) > 1:
+            self.minor = int(segs[1])
+            if len(segs) > 2:
+              self.patch = int(segs[2])
+
+  def _is_valid_operand(self, other):
+    return hasattr(other, 'major') and hasattr(other, 'minor') and hasattr(other, 'patch')
+
+  def __eq__(self, other):
+    if not self._is_valid_operand(other):
+      return NotImplemented
+    return self.major == other.major and self.minor == other.minor and self.patch == other.patch
+
+  def __lt__(self, other):
+    if not self._is_valid_operand(other):
+      return NotImplemented
+    return (self.major, self.minor, self.patch) < (other.major, other.minor, other.patch)
+
+  def __str__(self):
+    if self.major == 0 and self.minor == 0 and self.patch == 0:
+      return f"None"
+    return f"{self.major}.{self.minor}.{self.patch}"
+
+  def is_missing(self):
+    return self.major == 0 and self.minor == 0 and self.patch == 0
 
 
 class BasePkgHandler:
@@ -111,9 +201,13 @@ class BasePkgHandler:
   def get_type(self):
     return 'base'
 
-  def set_pkg(self, name, pkg):
+  def set_pkg(self, name, pkg, prefs):
     self.name = name
     self.repo = pkg['repo']
+    self.require =  prefs['require']  + pkg['require']
+    self.disallow = prefs['disallow'] + pkg['disallow']
+    self.prefer =   prefs['prefer']   + pkg['prefer']
+    self.avoid =    prefs['avoid']    + pkg['avoid']
 
   def get_installed_ver(self):
     return None
@@ -139,39 +233,11 @@ class DebPkgHandler(BasePkgHandler):
       result = result.split()
       if len(result) > 1:
         result = result[1]
-        return sanitize_semver(result.split('-')[0])
-    return None
+        return Version(result.split('-')[0])
+    return Version()
 
   def select_asset(self, candidates):
-
-    # the asset has to be a deb file
-    candidates = [ name for name in candidates if name.endswith(".deb")]
-
-    name_tags = {}
-    for name in candidates:
-      # TODO: cannot break on x86_64
-      name_tags[name] = [ s.lower() for s in re.split(r'-|_|\.', name) ]
-
-    # try to filter based on system.  revert is no remaining candidate
-    potentials = [ name for name in candidates if ARCH_SYSTEM in name_tags[name] ]
-    if len(potentials) > 0 and len(potentials) < len(candidates):
-      candidates = potentials
-
-    # machine is a bit more complicated due to multple word matches
-    # try the ARCH_MACHINE first
-    # try each in turn
-    for keyword in get_machine_keywords():
-      potentials = [ name for name in candidates if keyword in name_tags[name] ]
-      if len(potentials) > 0 and len(potentials) < len(candidates):
-        candidates = potentials
-
-    # if we still have too many, try throwing out the musl
-    if len(candidates) > 1:
-      potentials = [ name for name in candidates if 'musl' not in name_tags[name] ]
-      if len(potentials) > 0 and len(potentials) < len(candidates):
-        candidates = potentials
-
-    return candidates
+    return select_asset(candidates, DEB_EXTENSIONS, self.require, self.disallow, self.prefer, self.avoid)
 
   def install(self, fname):
     result = subprocess.run(['sudo', 'bash', '-c', 'apt install ' + fname])
@@ -188,8 +254,8 @@ class TarballPkgHandler(BasePkgHandler):
   def get_type(self):
     return 'tar'
 
-  def set_pkg(self, name, pkg):
-    super().set_pkg(self, pkg)
+  def set_pkg(self, name, pkg, prefs):
+    super().set_pkg(name, pkg, prefs)
     self.ver_cmd = pkg['ver_cmd']
     self.ver_match = pkg['ver_match']
 
@@ -199,60 +265,27 @@ class TarballPkgHandler(BasePkgHandler):
       result = result.split("\n")[0]
       match = re.match(self.ver_match, result)
       if match:
-        return sanitize_semver(match.group(1))
-    return None
+        return Version(match.group(1))
+    return Version()
 
   def select_asset(self, candidates):
-
-    # gotta consider all of the possible tarball extensions
-    potentials = []
-    for candidate in candidates:
-      for ext in TAR_EXTENSIONS:
-        if candidate.endswith(ext):
-          potentials.append(candidate)
-          break
-    candidates = potentials
-
-    name_tags = {}
-    for name in candidates:
-      # TODO: cannot break on x86_64
-      name_tags[name] = [ s.lower() for s in re.split(r'-|_|\.', name) ]
-
-    # try to filter based on system.  revert is no remaining candidate
-    potentials = [ name for name in candidates if ARCH_SYSTEM in name_tags[name] ]
-    if len(potentials) > 0 and len(potentials) < len(candidates):
-      candidates = potentials
-
-    # machine is a bit more complicated due to multple word matches
-    # try the ARCH_MACHINE first
-    # try each in turn
-    for keyword in get_machine_keywords():
-      potentials = [ name for name in candidates if keyword in name_tags[name] ]
-      if len(potentials) > 0 and len(potentials) < len(candidates):
-        candidates = potentials
-
-    # if we still have too many, try throwing out the musl
-    if len(candidates) > 1:
-      potentials = [ name for name in candidates if 'musl' not in name_tags[name] ]
-      if len(potentials) > 0 and len(potentials) < len(candidates):
-        candidates = potentials
-
-    return candidates
+    return select_asset(candidates, TAR_EXTENSIONS, self.require, self.disallow, self.prefer, self.avoid)
 
   def install(self, fname):
+    print("Automatic installation of tarball not supported at this time.")
+    print("The downloaded file will remain for manual inspection")
     return False
 
 
-def list_package(hdlr, name, pkg):
-  hdlr.set_pkg(name, pkg)
-  print(f"{hdlr.get_type():<3} {name+":":<15} {safe_ver(hdlr.get_installed_ver()):<10}")
+def do_op(op, hdlr, gh, token, name, pkg, prefs):
 
-
-def do_op(op, hdlr, gh, token, name, pkg):
-
-  hdlr.set_pkg(name, pkg)
+  hdlr.set_pkg(name, pkg, prefs)
   installed_ver = hdlr.get_installed_ver()
-  print(f"{hdlr.get_type():<3} {name+":":<15} {safe_ver(installed_ver):<10}", end='')
+  print(f"{hdlr.get_type():<3} {name+":":<15} {str(installed_ver):<10}", end='')
+
+  if op == MODE_LIST:
+    print()
+    return
 
   # get the repo's latest release
   try:
@@ -266,89 +299,61 @@ def do_op(op, hdlr, gh, token, name, pkg):
     print(f"\nFailed: Release not found for {name} at {hdlr.repo}.")
     return
 
-  released_ver = sanitize_semver(release.tag_name)
-  if released_ver is None:
+  released_ver = Version(release.tag_name)
+  if released_ver.is_missing():
     print(f"\nFailed: Unreadable release version for {name} at {hdlr.repo}.")
     return
 
-  print(f" {safe_ver(released_ver):<10}", end='')
-  if installed_ver is None or semver.compare(installed_ver, released_ver) < 0:
+  print(f" {str(released_ver):<10}", end='')
 
-    # newer version on github, construct a map of assets
-    assets = {}
-    for asset in release.get_assets():
-      assets[asset.name] = asset
+  # newer version on github, construct a map of assets
+  assets = {}
+  for asset in release.get_assets():
+    assets[asset.name] = asset
 
-    finalists = hdlr.select_asset(list(assets.keys()))
-    if len(finalists) == 0:
-      print("None", end='')
-    elif len(finalists) > 1:
-      print(", ".join(finalists), end='')
-    else:
-      finalist = finalists[0]
-      print(f"{finalist}", end='')
+  update_avail = (not released_ver.is_missing()) and (installed_ver.is_missing() or installed_ver < released_ver)
+  if not update_avail:
+    print("     ", end='')
+  elif op == MODE_DOWNLOAD:
+    print("down ", end='')
+  else:
+    print("inst ", end='')
 
-      # if this is just for info, we're all done
-      if op != MODE_INFO:
-        pass
+  finalists = hdlr.select_asset(list(assets.keys()))
+  if len(finalists) == 0:
+    print("None", end='')
+  elif len(finalists) > 1:
+    print(", ".join(finalists), end='')
+  else:
+    finalist = finalists[0]
+    asset = assets[finalist]
+    print(f"{finalist}", end='')
+
+    # if this is just for info or no update is available, we're all done
+    if op != MODE_INFO:
+      if op == MODE_INSTALL or update_avail:
+
+        print(f"\n\nDownloading {asset.name} to {TMPDIR} ... ", end='')
+
+        # download asset to tmp directory
+        os.makedirs(TMPDIR, exist_ok=True)
+        headers = {"Accept": "application/octet-stream"}
+        if token is not None:
+          headers["Authorization"] = f"token {token}"
+        response = requests.Session().get(asset.url, stream=True, headers=headers)
+        pathname = os.path.join(TMPDIR, asset.name)
+        with open(pathname, "wb") as outfile:
+          for chunk in response.iter_content(1024*1024):
+            outfile.write(chunk)
+        print("Done.")
+
+        if op != MODE_DOWNLOAD:
+          if hdlr.install(pathname):
+            os.remove(pathname)
+          else:
+            print(f"Installation did not complete")
 
   print()
-
-
-def update_package(hdlr, gh, token, name, pkg, do_install, be_verbose):
-  pass
-    # print(f"Package {name}, Installed: {installed_ver}, released: {released_ver}.")
-    # if installed_ver is None or semver.compare(installed_ver, released_ver) < 0:
-
-    # if installed_ver is None:
-    #   print(f"Installing {name} version {released_ver}.")
-    # else:
-    #   print(f"Upgrading {name} version from {installed_ver} to {released_ver}.")
-
-    # # newer version on github
-    # assets = {}
-    # for asset in release.get_assets():
-    #   assets[asset.name] = asset
-
-    # finalists = handler.select_asset(list(assets.keys()))
-    # if len(finalists) == 0:
-    #   print(f"WARNING: Unable to find matching asset for {name} in release {released_ver}.")
-    # else:
-    #   if len(finalists) > 1:
-    #     print("WARNING: multiple viable candidates. Downloading all candidates and skipping installation.")
-
-    #   for finalist in finalists:
-    #     asset = assets[finalist]
-
-    #     if mode == MODE_DRY_RUN:
-    #       print(f"  Selected {asset.name} for download", end = "")
-    #       if len(finalists) == 1:
-    #         print(" and installation", end='')
-    #       print(".")
-    #     else:
-
-    #       # download asset to tmp directory
-    #       os.makedirs(TMPDIR, exist_ok=True)
-    #       headers = { "Authorization": f"token {token}", "Accept": "application/octet-stream"}
-    #       response = requests.Session().get(asset.url, stream=True, headers=headers)
-    #       pathname = os.path.join(TMPDIR, asset.name)
-    #       if verbose:
-    #         print(f"Downloading {asset.name} ...", end = '')
-    #       with open(pathname, "wb") as outfile:
-    #         for chunk in response.iter_content(1024*1024):
-    #           outfile.write(chunk)
-    #       if verbose:
-    #         print(" Done")
-
-    #       if mode == MODE_DOWNLOAD_ONLY:
-    #         print(f"Package {name} saved as {pathname}.")
-    #       elif len(finalists) != 1:
-    #         print(f"Installation skipped. Package {name} saved as {pathname}.")
-    #       else:
-    #         if handler.install(pathname):
-    #           os.remove(pathname)
-    #         else:
-    #           print(f"Installation failed.  Downloaded file at: {pathname}")
 
 
 def main(args):
@@ -357,6 +362,18 @@ def main(args):
   if args.file is None:
     args.file = f"{os.environ['XDG_CONFIG_HOME']}" if 'XDG_CONFIG_HOME' in os.environ else f"{os.environ['HOME']}/.config" if 'HOME' in os.environ else ""
     args.file+="/host-config/ghr.yaml"
+
+  # look if various places for a github token
+  if args.token is None and args.op != MODE_LIST:
+
+    # try the environment
+    args.token = os.environ.get('GITHUB_GHR_TOKEN', None)
+    if args.token is None:
+
+      # still looking... try pass
+      args.token = run_prog("pass github/ghr-token")
+      if args.token is not None and isinstance(args.token, str):
+        args.token = args.token.strip()
 
   cfg = {}
   try:
@@ -367,9 +384,25 @@ def main(args):
   except Exception as err:
     fatal(1, f"Unexpected {err=}, {type(err)=}")
 
+  # load global selection preferences first
+  if 'global' not in cfg:
+    cfg['global'] = {}
+  global_prefs = {}
+  for key in ['require', 'disallow', 'prefer', 'avoid']:
+    global_prefs[key] = cfg['global'][key] if key in cfg['global'] and cfg['global'][key] is not None else []
+
+  # get either an authorized or anonymous github instance
+  if args.token is not None:
+    auth = Auth.Token(args.token)
+    gh = Github(auth=auth)
+  else:
+    gh = Github()
+
   for pkg_type, pkgs in cfg.items():
     hdlr = None
-    if pkg_type == 'deb':
+    if pkg_type == 'global':
+      continue
+    elif pkg_type == 'deb':
       hdlr = DebPkgHandler()
     elif pkg_type == 'tar':
       hdlr = TarballPkgHandler()
@@ -378,13 +411,12 @@ def main(args):
       print(f"Error: unsupported package type: {pkg_type}")
     else:
       for name, pkg in pkgs.items():
-        if args.op == MODE_LIST:
-          list_package(hdlr, name, pkg)
-        else:
-          # other ops require an authorized github instance
-          auth = Auth.Token(args.token)
-          gh = Github(auth=auth)
-          do_op(args.op, hdlr, gh, args.token, name, pkg)
+        # normalize the config. much simplier than checking for None everywhere
+        for key in ['require', 'disallow', 'prefer', 'avoid']:
+          if key not in pkg or pkg[key] is None:
+            pkg[key] = []
+
+        do_op(args.op, hdlr, gh, args.token, name, pkg, global_prefs)
 
   return 0
 
@@ -395,16 +427,15 @@ if __name__ == "__main__":
       "list": MODE_LIST,
       "info": MODE_INFO,
       "download": MODE_DOWNLOAD,
-      "update": MODE_UPDATE
+      "update": MODE_UPDATE,
+      "install": MODE_INSTALL
     }
 
   ensure_binaries([])
   parser = argparse.ArgumentParser(prog='ghr-util', description='Utility for updating packages/binaries from Github releases', epilog='')
   parser.add_argument("op", choices=list(map_modes), help="Operation to perform.")
-  parser.add_argument("--token", default=None, help="Github access token with read privledge (required if op is not 'list')")
+  parser.add_argument("--token", default=None, help="Github access token with repository read privledge")
   parser.add_argument("file", nargs='?', default=None, help="Configuration file (defaults to $XDG_CONFIG_DIR/config/host-config/ghr.yaml).")
   args = parser.parse_args()
   args.op = map_modes[args.op]
-  if args.op != MODE_LIST and (args.token is None or len(args.token) == 0):
-    raise argparse.ArgumentError("token is a required argument for info, download, and update operations")
   exit(main(args))
