@@ -16,11 +16,6 @@ from github import Github
 from github import Auth
 from github import GithubException
 
-# TODO: auto-install tarball. for my current tarballs that means...
-#   fzf:  fzf--.tar.gz → fzf, chown, mv to /usr/bin
-#   skim: skim--*.tar.xz gzip skim../man/man1/sk.1, chown, mv sk.1.gz /usr/share/man/man1, chown sk, mv sk /usr/bin
-#   starship: starship--.tar.gz → starship, chown, mv to /usr/bin
-
 MODE_LIST = 1
 MODE_INFO = 2
 MODE_DOWNLOAD = 3
@@ -46,6 +41,10 @@ def fatal(ret_code, str = None):
   exit(ret_code)
 
 
+def is_nonempty_str(s):
+  return s is not None and isinstance(s, str) and len(s) > 0
+
+
 def ensure_binaries(prgs):
   if isinstance(prgs, str):
     if shutil.which(prgs) is None:
@@ -66,7 +65,7 @@ def get_machine_keywords():
   return keywords
 
 
-def run_prog(prog, args=None, input=None, silent_fail=True):
+def run_prog(prog, args=None, cwd=None, input=None, fatal_fail=False):
 
   if args is not None:
     run_args = [prog]
@@ -75,14 +74,14 @@ def run_prog(prog, args=None, input=None, silent_fail=True):
     run_args = shlex.split(prog)
 
   try:
-    result = subprocess.run(run_args, input=input, capture_output=True, text=True)
+    result = subprocess.run(run_args, input=input, capture_output=True, text=True, cwd=cwd)
   except:
-    if not silent_fail:
+    if fatal_fail:
       fatal(1, f"Failed to execute: {" ".join(run_args)}")
     return None
 
-  if result.returncode != 0 or len(result.stderr) > 0:
-    if not silent_fail:
+  if result.returncode != 0:
+    if fatal_fail:
       fatal(1, f"Failed to execute: {" ".join(run_args)}\nReturn Code {result.returncode}\n{result.stderr}")
     return None
 
@@ -160,16 +159,18 @@ class Version:
     self.major = 0
     self.minor = 0
     self.patch = 0
-    if s is not None and isinstance(s, str):
-      s = s.lstrip("vV")
-      if len(s) > 0 and re.match('^[0-9.]+$', s):
-        segs = s.split('.')
-        if len(segs) > 0:
-          self.major = int(segs[0])
-          if len(segs) > 1:
-            self.minor = int(segs[1])
-            if len(segs) > 2:
-              self.patch = int(segs[2])
+    if is_nonempty_str(s):
+      match = re.match(r'.*?([0-9.]+).*?', s)
+      if match:
+        s = match.group(1)
+        if len(s) > 0:
+          segs = s.split('.')
+          if len(segs) > 0:
+            self.major = int(segs[0])
+            if len(segs) > 1:
+              self.minor = int(segs[1])
+              if len(segs) > 2:
+                self.patch = int(segs[2])
 
   def _is_valid_operand(self, other):
     return hasattr(other, 'major') and hasattr(other, 'minor') and hasattr(other, 'patch')
@@ -229,7 +230,7 @@ class DebPkgHandler(BasePkgHandler):
 
   def get_installed_ver(self):
     result = run_prog(f"dpkg-query --show {self.name}")
-    if result is not None and isinstance(result, str) and len(result) > 0:
+    if is_nonempty_str(result):
       result = result.split()
       if len(result) > 1:
         result = result[1]
@@ -257,23 +258,43 @@ class TarballPkgHandler(BasePkgHandler):
   def set_pkg(self, name, pkg, prefs):
     super().set_pkg(name, pkg, prefs)
     self.ver_cmd = pkg['ver_cmd']
-    self.ver_match = pkg['ver_match']
+    self.ver_match = pkg.get('ver_match', None)
+    self.install_script = pkg.get('install', None)
 
   def get_installed_ver(self):
     result = run_prog(self.ver_cmd)
-    if result is not None and len(result) > 0:
+    if is_nonempty_str(result):
+      # just the 1st line
       result = result.split("\n")[0]
-      match = re.match(self.ver_match, result)
-      if match:
-        return Version(match.group(1))
+      if self.ver_match is not None:
+        match = re.match(self.ver_match, result)
+        if match:
+          result = match.group(1)
+      return Version(result)
     return Version()
 
   def select_asset(self, candidates):
     return select_asset(candidates, TAR_EXTENSIONS, self.require, self.disallow, self.prefer, self.avoid)
 
   def install(self, fname):
-    print("Automatic installation of tarball not supported at this time.")
-    print("The downloaded file will remain for manual inspection")
+    path, file = os.path.split(fname)
+    print(f"Extracting {file} ... ", end='')
+    result = run_prog(f"tar -xf {fname}", cwd=path)
+    if result is None:
+      print(f"Failed.")
+    else:
+      print(f"Done.")
+      if is_nonempty_str(self.install_script):
+        print(f"Installing {self.name} ... ", end='')
+        result = subprocess.run(['sudo', 'bash', '-c', self.install_script], cwd=path)
+        if result.returncode == 0:
+          print("Done.")
+          return True
+        else:
+          print("Failed.")
+          print(f"Install script for {self.name} failed. Manually install {fname}")
+      else:
+        print(f"Automatic installation of tarball for {self.name} is not configured. Manually install {fname}")
     return False
 
 
@@ -292,9 +313,16 @@ def do_op(op, hdlr, gh, token, name, pkg, prefs):
     return
 
   # get the repo's latest release
+  release = None
   try:
     repo = gh.get_repo(hdlr.repo)
-    release = repo.get_latest_release()
+    if 'rel_match' in pkg:
+      for rel in repo.get_releases():
+        if re.match(pkg['rel_match'], rel.tag_name):
+          release = rel
+          break
+    else:
+      release = repo.get_latest_release()
   except GithubException as err:
     print(f"\nFailed: Github access for {name} at {hdlr.repo}: {err.status}.")
     return
@@ -362,11 +390,6 @@ def do_op(op, hdlr, gh, token, name, pkg, prefs):
 
 def main(args):
 
-    # load the configuration
-  if args.file is None:
-    args.file = f"{os.environ['XDG_CONFIG_HOME']}" if 'XDG_CONFIG_HOME' in os.environ else f"{os.environ['HOME']}/.config" if 'HOME' in os.environ else ""
-    args.file+="/host-config/ghr.yaml"
-
   # look if various places for a github token
   if args.token is None and args.op != MODE_LIST:
 
@@ -376,8 +399,21 @@ def main(args):
 
       # still looking... try pass
       args.token = run_prog("pass github/ghr-token")
-      if args.token is not None and isinstance(args.token, str):
-        args.token = args.token.strip()
+      if is_nonempty_str(args.token):
+        args.token = args.token.split("\n")[0].strip()
+
+  # load the configuration
+  if os.pathsep not in args.file:
+
+    # if just a filename, then look for file in default config directory
+    if 'XDG_CONFIG_HOME' in os.environ:
+      cfg_dir = os.path.join(os.environ['XDG_CONFIG_HOME'], 'host-config')
+    elif 'HOME' in os.environ:
+      cfg_dir = os.path.join(os.environ['HOME'], '.config', 'host-config')
+    else:
+      cfg_dir = None
+    if cfg_dir is not None:
+      args.file = os.path.join(cfg_dir, args.file)
 
   cfg = {}
   try:
@@ -435,11 +471,11 @@ if __name__ == "__main__":
       "install": MODE_INSTALL
     }
 
-  ensure_binaries([])
+  ensure_binaries(['tar'])
   parser = argparse.ArgumentParser(prog='ghr-util', description='Utility for updating packages/binaries from Github releases', epilog='')
   parser.add_argument("op", choices=list(map_modes), help="Operation to perform.")
   parser.add_argument("--token", default=None, help="Github access token with repository read privledge")
-  parser.add_argument("file", nargs='?', default=None, help="Configuration file (defaults to $XDG_CONFIG_DIR/config/host-config/ghr.yaml).")
+  parser.add_argument("file", help="Configuration file (full pathname or filename in $XDG_CONFIG_DIR/host-config)")
   args = parser.parse_args()
   args.op = map_modes[args.op]
   exit(main(args))
