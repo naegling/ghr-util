@@ -12,7 +12,7 @@
       "program": "${file}",
       "console": "integratedTerminal",
       // "args": [ "list", "--verbose" ]
-      "args": [ "update", "--token=${env:GITHUB_GHR_TOKEN}", "ghr-gui.yaml" ]
+      "args": [ "update", "all" ]
       // "args": "${command:pickArgs}"
     }
   ]

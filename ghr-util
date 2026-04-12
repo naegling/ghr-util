@@ -28,7 +28,7 @@ ARCH = platform.uname()
 ARCH_SYSTEM = ARCH.system.lower()
 ARCH_MACHINE = ARCH.machine.lower()
 ALT_MACHINE_KEYWORDS = {
-                        'x86_64' :  ['amd64']
+                        'x86_64' :  ['amd64', 'x64']
                         }
 
 DEB_EXTENSIONS = ['.deb']
@@ -219,6 +219,9 @@ class BasePkgHandler:
   def install(self, fname):
     return False
 
+  def finalize(self):
+    return
+
 
 class DebPkgHandler(BasePkgHandler):
 
@@ -257,11 +260,14 @@ class TarballPkgHandler(BasePkgHandler):
 
   def set_pkg(self, name, pkg, prefs):
     super().set_pkg(name, pkg, prefs)
-    self.ver_cmd = pkg['ver_cmd']
+    self.ver_cmd = pkg.get('ver_cmd', None)
+    if self.ver_cmd is None:
+      self.ver_cmd = f"{name} --version"
     self.ver_match = pkg.get('ver_match', None)
     self.install_script = pkg.get('install', None)
 
   def get_installed_ver(self):
+
     result = run_prog(self.ver_cmd)
     if is_nonempty_str(result):
       # just the 1st line
@@ -333,7 +339,7 @@ def do_op(op, hdlr, gh, token, name, pkg, prefs):
 
   released_ver = Version(release.tag_name)
   if released_ver.is_missing():
-    print(f"\nFailed: Unreadable release version for {name} at {hdlr.repo}.")
+    print(f"Failed: Unreadable release version for {name} at {hdlr.repo}.")
     return
 
   print(f" {str(released_ver):<10}", end='')
@@ -342,48 +348,58 @@ def do_op(op, hdlr, gh, token, name, pkg, prefs):
   assets = {}
   for asset in release.get_assets():
     assets[asset.name] = asset
-
-  update_avail = (not released_ver.is_missing()) and (installed_ver.is_missing() or installed_ver < released_ver)
-  if not update_avail:
-    print("     ", end='')
-  elif op == MODE_DOWNLOAD:
-    print("down ", end='')
-  else:
-    print("inst ", end='')
-
   finalists = hdlr.select_asset(list(assets.keys()))
   if len(finalists) == 0:
-    print("None", end='')
+    print("err  No asset found", end='')
   elif len(finalists) > 1:
+    print("err  Mulitple assets found: ", end='')
     print(", ".join(finalists), end='')
   else:
     finalist = finalists[0]
     asset = assets[finalist]
-    print(f"{finalist}", end='')
+    done = True
+    if op == MODE_INFO:
+      if installed_ver.is_missing():
+        print("inst ", end='')
+      elif installed_ver < released_ver:
+        print("updt", end='')
+      else:
+        print("    ", end='')
+    if op == MODE_DOWNLOAD and (installed_ver.is_missing() or installed_ver < released_ver):
+      print("down ", end='')
+      done = False
+    elif op == MODE_INSTALL and installed_ver.is_missing():
+      print("inst ", end='')
+      done = False
+    elif op == MODE_UPDATE and (not installed_ver.is_missing) and installed_ver < released_ver:
+      print("updt ", end='')
+      done = False
+    else:
+      print("     ", end='')
+    print(f"{finalist}")
 
-    # if this is just for info or no update is available, we're all done
-    if op != MODE_INFO:
-      if op == MODE_INSTALL or update_avail:
+    if done:
+      return
 
-        print(f"\n\nDownloading {asset.name} to {TMPDIR} ... ", end='')
+    print(f"\n\nDownloading {asset.name} to {TMPDIR} ... ", end='')
 
-        # download asset to tmp directory
-        os.makedirs(TMPDIR, exist_ok=True)
-        headers = {"Accept": "application/octet-stream"}
-        if token is not None:
-          headers["Authorization"] = f"token {token}"
-        response = requests.Session().get(asset.url, stream=True, headers=headers)
-        pathname = os.path.join(TMPDIR, asset.name)
-        with open(pathname, "wb") as outfile:
-          for chunk in response.iter_content(1024*1024):
-            outfile.write(chunk)
-        print("Done.")
+    # download asset to tmp directory
+    os.makedirs(TMPDIR, exist_ok=True)
+    headers = {"Accept": "application/octet-stream"}
+    if token is not None:
+      headers["Authorization"] = f"token {token}"
+    response = requests.Session().get(asset.url, stream=True, headers=headers)
+    pathname = os.path.join(TMPDIR, asset.name)
+    with open(pathname, "wb") as outfile:
+      for chunk in response.iter_content(1024*1024):
+        outfile.write(chunk)
+    print("Done.")
 
-        if op != MODE_DOWNLOAD:
-          if hdlr.install(pathname):
-            os.remove(pathname)
-          else:
-            print(f"Installation did not complete")
+    if op != MODE_DOWNLOAD:
+      if hdlr.install(pathname):
+        os.remove(pathname)
+      else:
+        print(f"Installation did not complete")
 
   print()
 
@@ -402,8 +418,14 @@ def main(args):
       if is_nonempty_str(args.token):
         args.token = args.token.split("\n")[0].strip()
 
+  # flag for all packages
+  all_pkgs = False
+  if len(args.pkgs) == 1 and args.pkgs[0] == "all":
+    args.pkgs = []
+    all_pkgs = True
+
   # load the configuration
-  if os.pathsep not in args.file:
+  if os.pathsep not in args.config:
 
     # if just a filename, then look for file in default config directory
     if 'XDG_CONFIG_HOME' in os.environ:
@@ -413,11 +435,11 @@ def main(args):
     else:
       cfg_dir = None
     if cfg_dir is not None:
-      args.file = os.path.join(cfg_dir, args.file)
+      args.config = os.path.join(cfg_dir, args.config)
 
   cfg = {}
   try:
-    with open(args.file) as infile:
+    with open(args.config) as infile:
       cfg = yaml.safe_load(infile)
   except IOError as err:
     fatal(1, f"{err}")
@@ -432,10 +454,11 @@ def main(args):
     global_prefs[key] = cfg['global'][key] if key in cfg['global'] and cfg['global'][key] is not None else []
 
   # get either an authorized or anonymous github instance
+  gh = None
   if args.token is not None:
     auth = Auth.Token(args.token)
     gh = Github(auth=auth)
-  else:
+  elif args.op != MODE_LIST:
     gh = Github()
 
   for pkg_type, pkgs in cfg.items():
@@ -451,12 +474,23 @@ def main(args):
       print(f"Error: unsupported package type: {pkg_type}")
     else:
       for name, pkg in pkgs.items():
-        # normalize the config. much simplier than checking for None everywhere
-        for key in ['require', 'disallow', 'prefer', 'avoid']:
-          if key not in pkg or pkg[key] is None:
-            pkg[key] = []
+        if not isinstance(pkg, dict):
+          repo = str(pkg)
+          pkg = {}
+          pkg['repo'] = repo
 
-        do_op(args.op, hdlr, gh, args.token, name, pkg, global_prefs)
+        if all_pkgs or name in args.pkgs:
+          # normalize the config. much simplier than checking for None everywhere
+          for key in ['require', 'disallow', 'prefer', 'avoid']:
+            if key not in pkg or pkg[key] is None:
+              pkg[key] = []
+
+          do_op(args.op, hdlr, gh, args.token, name, pkg, global_prefs)
+          args.pkgs = [ pkg for pkg in args.pkgs if pkg != name ]
+
+      hdlr.finalize()
+  for pkg in args.pkgs:
+    print(f"Error: unrecognized package: {pkg}")
 
   return 0
 
@@ -474,8 +508,9 @@ if __name__ == "__main__":
   ensure_binaries(['tar'])
   parser = argparse.ArgumentParser(prog='ghr-util', description='Utility for updating packages/binaries from Github releases', epilog='')
   parser.add_argument("op", choices=list(map_modes), help="Operation to perform.")
-  parser.add_argument("--token", default=None, help="Github access token with repository read privledge")
-  parser.add_argument("file", help="Configuration file (full pathname or filename in $XDG_CONFIG_DIR/host-config)")
+  parser.add_argument("-t", "--token", default=None, help="Github access token with repository read privledge")
+  parser.add_argument("-c", "--config", nargs="?", default="ghr.yaml", help="Configuration file (full pathname or filename in $XDG_CONFIG_DIR/host-config)")
+  parser.add_argument("pkgs", nargs="+", default=[], help="List of package names")
   args = parser.parse_args()
   args.op = map_modes[args.op]
   exit(main(args))
