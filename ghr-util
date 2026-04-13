@@ -16,6 +16,10 @@ from github import Github
 from github import Auth
 from github import GithubException
 
+# TODO: make this multithreaded
+# TODO: install all debs in one apt call
+
+
 MODE_LIST = 1
 MODE_INFO = 2
 MODE_DOWNLOAD = 3
